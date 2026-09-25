@@ -1,257 +1,17 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <math.h>
-#include <pthread.h>
 #include <sys/time.h>
-#if defined(__aarch64__)
-#include <arm_neon.h>
-#elif defined(__AVX2__)
-#include <immintrin.h>
-#else
-#error "Unsupported architecture: need AArch64 NEON or x86 AVX2+FMA"
-#endif
 
-/* Problem size & threading */
-#ifndef N
-#define N 4096 /* matrix order */
+#include "src/gemm_local.h"
+
+/* Problem size & threading defaults (override at runtime: ./dgemm [N] [threads]) */
+#ifndef N_DEFAULT
+#define N_DEFAULT 4096 /* matrix order */
 #endif
 #ifndef NUM_THREADS
 #define NUM_THREADS 12 /* override with -DNUM_THREADS=n */
 #endif
-
-/* Blocking parameters (tune once per CPU) */
-#ifndef KC
-#define KC 256
-#endif
-#ifndef MC
-#define MC 6
-#endif
-#ifndef NC
-#define NC 64
-#endif
-#define MR 6
-#define NR 8
-
-#define MIN(a,b) ((a) < (b) ? (a) : (b))
-
-#if defined(__aarch64__)
-/*
-    6×8 NEON micro-kernel (128-bit, 2 doubles per vector)
-    A: MR × kc
-    B: kc × NR
-    C: MR × NR
-*/
-static inline void micro_kernel_6x8(
-    int kc,
-    const double *restrict A,
-    const double *restrict B, int ldb,
-    double *restrict C, int ldc
-)
-{
-    float64x2_t c[MR][4];
-    for (int i = 0; i < MR; ++i)
-        for (int j = 0; j < 4; ++j)
-            c[i][j] = vdupq_n_f64(0.0);
-
-    for (int p = 0; p < kc; ++p) {
-        const double *bp = B + p * ldb;
-        float64x2_t b0 = vld1q_f64(bp + 0);
-        float64x2_t b1 = vld1q_f64(bp + 2);
-        float64x2_t b2 = vld1q_f64(bp + 4);
-        float64x2_t b3 = vld1q_f64(bp + 6);
-
-        for (int i = 0; i < MR; ++i) {
-            float64x2_t a = vld1q_dup_f64(A + i * kc + p);
-            c[i][0] = vfmaq_f64(c[i][0], a, b0);
-            c[i][1] = vfmaq_f64(c[i][1], a, b1);
-            c[i][2] = vfmaq_f64(c[i][2], a, b2);
-            c[i][3] = vfmaq_f64(c[i][3], a, b3);
-        }
-    }
-
-    for (int i = 0; i < MR; ++i) {
-        double *cp = C + i * ldc;
-        for (int j = 0; j < 4; ++j)
-            vst1q_f64(cp + 2 * j, vaddq_f64(c[i][j], vld1q_f64(cp + 2 * j)));
-    }
-}
-#else
-/*
-    6×8 AVX2 / FMA micro‑kernel
-    A: MR × kc
-    B: kc × NR
-    C: MR × NR
-*/
-static inline void micro_kernel_6x8(
-    int kc,
-    const double *restrict A,
-    const double *restrict B, int ldb,
-    double *restrict C, int ldc
-)
-{
-    __m256d c00 = _mm256_setzero_pd(), c01 = _mm256_setzero_pd();
-    __m256d c10 = _mm256_setzero_pd(), c11 = _mm256_setzero_pd();
-    __m256d c20 = _mm256_setzero_pd(), c21 = _mm256_setzero_pd();
-    __m256d c30 = _mm256_setzero_pd(), c31 = _mm256_setzero_pd();
-    __m256d c40 = _mm256_setzero_pd(), c41 = _mm256_setzero_pd();
-    __m256d c50 = _mm256_setzero_pd(), c51 = _mm256_setzero_pd();
-
-    for (int p = 0; p < kc; ++p) {
-        __m256d b0 = _mm256_loadu_pd(B + p * ldb + 0);
-        __m256d b1 = _mm256_loadu_pd(B + p * ldb + 4);
-
-        __m256d a;
-        a = _mm256_broadcast_sd(A + 0 * kc + p);
-        c00 = _mm256_fmadd_pd(a, b0, c00);
-        c01 = _mm256_fmadd_pd(a, b1, c01);
-
-        a = _mm256_broadcast_sd(A + 1 * kc + p);
-        c10 = _mm256_fmadd_pd(a, b0, c10);
-        c11 = _mm256_fmadd_pd(a, b1, c11);
-
-        a = _mm256_broadcast_sd(A + 2 * kc + p);
-        c20 = _mm256_fmadd_pd(a, b0, c20);
-        c21 = _mm256_fmadd_pd(a, b1, c21);
-
-        a = _mm256_broadcast_sd(A + 3 * kc + p);
-        c30 = _mm256_fmadd_pd(a, b0, c30);
-        c31 = _mm256_fmadd_pd(a, b1, c31);
-
-        a = _mm256_broadcast_sd(A + 4 * kc + p);
-        c40 = _mm256_fmadd_pd(a, b0, c40);
-        c41 = _mm256_fmadd_pd(a, b1, c41);
-
-        a = _mm256_broadcast_sd(A + 5 * kc + p);
-        c50 = _mm256_fmadd_pd(a, b0, c50);
-        c51 = _mm256_fmadd_pd(a, b1, c51);
-    }
-
-    _mm256_storeu_pd(
-        C + 0 * ldc + 0,
-        _mm256_add_pd(c00, _mm256_loadu_pd(C + 0 * ldc + 0))
-    );
-    _mm256_storeu_pd(
-        C + 0 * ldc + 4,
-        _mm256_add_pd(c01, _mm256_loadu_pd(C + 0 * ldc + 4))
-    );
-
-    _mm256_storeu_pd(
-        C + 1 * ldc + 0,
-        _mm256_add_pd(c10, _mm256_loadu_pd(C + 1 * ldc + 0))
-    );
-    _mm256_storeu_pd(
-        C + 1 * ldc + 4,
-        _mm256_add_pd(c11, _mm256_loadu_pd(C + 1 * ldc + 4))
-    );
-
-    _mm256_storeu_pd(
-        C + 2 * ldc + 0,
-        _mm256_add_pd(c20, _mm256_loadu_pd(C + 2 * ldc + 0))
-    );
-    _mm256_storeu_pd(
-        C + 2 * ldc + 4,
-        _mm256_add_pd(c21, _mm256_loadu_pd(C + 2 * ldc + 4))
-    );
-
-    _mm256_storeu_pd(
-        C + 3 * ldc + 0,
-        _mm256_add_pd(c30, _mm256_loadu_pd(C + 3 * ldc + 0))
-    );
-    _mm256_storeu_pd(
-        C + 3 * ldc + 4,
-        _mm256_add_pd(c31, _mm256_loadu_pd(C + 3 * ldc + 4))
-    );
-
-    _mm256_storeu_pd(
-        C + 4 * ldc + 0,
-        _mm256_add_pd(c40, _mm256_loadu_pd(C + 4 * ldc + 0))
-    );
-    _mm256_storeu_pd(
-        C + 4 * ldc + 4,
-        _mm256_add_pd(c41, _mm256_loadu_pd(C + 4 * ldc + 4))
-    );
-
-    _mm256_storeu_pd(
-        C + 5 * ldc + 0,
-        _mm256_add_pd(c50, _mm256_loadu_pd(C + 5 * ldc + 0))
-    );
-    _mm256_storeu_pd(
-        C + 5 * ldc + 4,
-        _mm256_add_pd(c51, _mm256_loadu_pd(C + 5 * ldc + 4))
-    );
-}
-
-#endif
-
-/* pack A (mc × kc) into contiguous buffer */
-static inline void pack_A(int mc, int kc, const double *A, int lda, double *Apack)
-{
-    for (int i = 0; i < mc; ++i) {
-        memcpy(Apack + i * kc, A + i * lda, kc * sizeof(double));
-    }
-}
-
-/* pack B (kc × nc) into contiguous buffer */
-static inline void pack_B(int kc, int nc, const double *B, int ldb, double *Bpack)
-{
-    for (int p = 0; p < kc; ++p) {
-        memcpy(Bpack + p * nc, B + p * ldb, nc * sizeof(double));
-    }
-}
-
-/* Threading */
-typedef struct {
-    double *A;
-    double *B;
-    double *C;
-    int      jc_start, jc_end;
-    double  *Apack;
-    double  *Bpack;
-} thread_arg_t;
-
-/* blocked DGEMM for columns jc_start ... jc_end‑1 */
-static void dgemm_slice(thread_arg_t *ts)
-{
-    for (int jc = ts->jc_start; jc < ts->jc_end; jc += NC) {
-        int nc = MIN(NC, N - jc);
-
-        for (int pc = 0; pc < N; pc += KC) {
-            int kc = MIN(KC, N - pc);
-            pack_B(kc, nc, ts->B + pc * N + jc, N, ts->Bpack);
-
-            for (int ic = 0; ic < N; ic += MC) {
-                int mc = MIN(MC, N - ic);
-                pack_A(mc, kc, ts->A + ic * N + pc, N, ts->Apack);
-
-                for (int jr = 0; jr < nc; jr += NR) {
-                    for (int ir = 0; ir < mc; ir += MR) {
-                        double *Cp = ts->C + (ic + ir) * N + jc + jr;
-                        if (ir + MR <= mc) {
-                            micro_kernel_6x8(kc, ts->Apack + ir * kc,
-                                             ts->Bpack + jr, nc, Cp, N);
-                        } else {
-                            /* edge tile: the kernel always writes MR rows, so
-                               accumulate into scratch and copy the valid rows */
-                            double tmp[MR * NR] = {0};
-                            micro_kernel_6x8(kc, ts->Apack + ir * kc,
-                                             ts->Bpack + jr, nc, tmp, NR);
-                            for (int i = 0; i < mc - ir; ++i)
-                                for (int j = 0; j < NR; ++j)
-                                    Cp[i * N + j] += tmp[i * NR + j];
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-static void *worker(void *arg)
-{
-    dgemm_slice((thread_arg_t *)arg);
-    return NULL;
-}
 
 /* helpers */
 static double wall_seconds(void)
@@ -261,7 +21,8 @@ static double wall_seconds(void)
     return tv.tv_sec + 1e-6 * tv.tv_usec;
 }
 
-static void *x_aligned_alloc(size_t alignment, size_t size) {
+static void *x_aligned_alloc(size_t alignment, size_t size)
+{
     void *ptr = NULL;
     if (posix_memalign(&ptr, alignment, size) != 0) {
         perror("posix_memalign");
@@ -270,70 +31,56 @@ static void *x_aligned_alloc(size_t alignment, size_t size) {
     return ptr;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    /* aligned allocation (64 B) */
-    double *A, *B, *C;
-    A = x_aligned_alloc(64, (size_t)N * N * sizeof(double));
-    B = x_aligned_alloc(64, (size_t)N * N * sizeof(double));
-    C = x_aligned_alloc(64, (size_t)N * N * sizeof(double));
+    int n = argc > 1 ? atoi(argv[1]) : N_DEFAULT;
+    int nthreads = argc > 2 ? atoi(argv[2]) : NUM_THREADS;
+    if (n <= 0 || nthreads <= 0) {
+        fprintf(stderr, "usage: %s [N] [threads]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    /* aligned allocation (64 B) */
+    size_t nn = (size_t)n * n;
+    double *A = x_aligned_alloc(64, nn * sizeof(double));
+    double *B = x_aligned_alloc(64, nn * sizeof(double));
+    double *C = x_aligned_alloc(64, nn * sizeof(double));
 
     /* initialise */
-    for (int i = 0; i < N; ++i) {
-        for (int j = 0; j < N; ++j) {
-            A[i * N + j] = (double)(i + j);
-            B[i * N + j] = (double)(i - j);
-            C[i * N + j] = 0.0;
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            A[(size_t)i * n + j] = (double)(i + j);
+            B[(size_t)i * n + j] = (double)(i - j);
+            C[(size_t)i * n + j] = 0.0;
         }
     }
 
-    /* assign column blocks to threads */
-    int jc_blocks = (N + NC - 1) / NC;
-    int blocks_per_thr = (jc_blocks + NUM_THREADS - 1) / NUM_THREADS;
-
-    pthread_t thr[NUM_THREADS];
-    thread_arg_t  arg[NUM_THREADS];
-
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        arg[t].A = A;
-        arg[t].B = B;
-        arg[t].C = C;
-
-        arg[t].jc_start = t * blocks_per_thr * NC;
-        arg[t].jc_end = (t + 1) * blocks_per_thr * NC;
-        if (arg[t].jc_end > N) arg[t].jc_end = N;
-
-        arg[t].Apack = x_aligned_alloc(64, MC * KC * sizeof(double));
-        arg[t].Bpack = x_aligned_alloc(64, KC * NC * sizeof(double));
-    }
-
     double t0 = wall_seconds();
-
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        pthread_create(&thr[t], NULL, worker, &arg[t]);
-    }
-
-    for (int t = 0; t < NUM_THREADS; ++t) {
-        pthread_join(thr[t], NULL);
-    }
-
+    dgemm_local(n, n, n, A, n, B, n, C, n, nthreads);
     double t1 = wall_seconds();
+
     printf("Time: %.3f s (%.1f GFLOP/s, %d threads)\n", t1 - t0,
-           2.0 * N * N * N / (t1 - t0) * 1e-9, NUM_THREADS);
+           2.0 * n * n * n / (t1 - t0) * 1e-9, nthreads);
 
 #ifdef VERIFY
+    /* exact check of every entry: sum_k (i+k)(k-j) = (i-j)*S1 - n*i*j + S2,
+       evaluated in integers so -ffast-math cannot reassociate it */
+    long long S1 = (long long)n * (n - 1) / 2;
+    long long S2 = (long long)(n - 1) * n * (2LL * n - 1) / 6;
     double maxerr = 0.0;
-    for (int s = 0; s < 64; ++s) {
-        int i = (int)(((long)s * 2654435761L) % N);
-        int j = (int)(((long)s * 40503L + 17) % N);
-        double ref = 0.0;
-        for (int k = 0; k < N; ++k) ref += A[i * N + k] * B[k * N + j];
-        double err = fabs(ref - C[i * N + j]) / (fabs(ref) + 1.0);
-        if (err > maxerr) maxerr = err;
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            double ref = (double)((i - j) * S1 - (long long)n * i * j + S2);
+            double err = fabs(ref - C[(size_t)i * n + j]) / (fabs(ref) + 1.0);
+            if (err > maxerr) maxerr = err;
+        }
     }
     printf("Verify: max rel err %.3e (%s)\n", maxerr, maxerr < 1e-9 ? "OK" : "FAIL");
     if (maxerr >= 1e-9) return 1;
 #endif
 
+    free(A);
+    free(B);
+    free(C);
     return 0;
 }

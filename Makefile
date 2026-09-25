@@ -25,23 +25,36 @@ ifdef VERIFY
 DFLAGS += -DVERIFY
 endif
 
-SRC := dgemm.c
 BIN_DIR := bin
-OBJ := $(patsubst %.c,$(BIN_DIR)/%.o,$(SRC))
 BIN := $(BIN_DIR)/dgemm
+TEST_BIN := $(BIN_DIR)/test_gemm_local
+LIB_OBJ := $(BIN_DIR)/gemm_local.o
+HDR := src/gemm_local.h
 
-.PHONY: all clean
+.PHONY: all test clean
 
 all: $(BIN)
 
 $(BIN_DIR):
 	mkdir -p $@
 
-$(BIN_DIR)/%.o: %.c Makefile | $(BIN_DIR)
+$(LIB_OBJ): src/gemm_local.c $(HDR) Makefile | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(DFLAGS) -c $< -o $@
 
-$(BIN): $(OBJ) Makefile
-	$(CC) -pthread $(OBJ) -o $@
+$(BIN_DIR)/dgemm.o: dgemm.c $(HDR) Makefile | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(DFLAGS) -c $< -o $@
+
+$(BIN_DIR)/test_gemm_local.o: tests/test_gemm_local.c $(HDR) Makefile | $(BIN_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BIN): $(BIN_DIR)/dgemm.o $(LIB_OBJ)
+	$(CC) -pthread $^ -o $@
+
+$(TEST_BIN): $(BIN_DIR)/test_gemm_local.o $(LIB_OBJ)
+	$(CC) -pthread $^ -o $@
+
+test: $(TEST_BIN)
+	./$(TEST_BIN)
 
 clean:
 	rm -rf $(BIN_DIR)
