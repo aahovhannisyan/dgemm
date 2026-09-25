@@ -1,16 +1,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 #include <sys/time.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__AVX2__)
 #include <immintrin.h>
+#else
+#error "Unsupported architecture: need AArch64 NEON or x86 AVX2+FMA"
+#endif
 
 /* Problem size & threading */
 #ifndef N
 #define N 4096 /* matrix order */
 #endif
 #ifndef NUM_THREADS
-#define NUM_THREADS 12
+#define NUM_THREADS 12 /* override with -DNUM_THREADS=n */
 #endif
 
 /* Blocking parameters (tune once per CPU) */
@@ -28,6 +35,48 @@
 
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 
+#if defined(__aarch64__)
+/*
+    6×8 NEON micro-kernel (128-bit, 2 doubles per vector)
+    A: MR × kc
+    B: kc × NR
+    C: MR × NR
+*/
+static inline void micro_kernel_6x8(
+    int kc,
+    const double *restrict A,
+    const double *restrict B, int ldb,
+    double *restrict C, int ldc
+)
+{
+    float64x2_t c[MR][4];
+    for (int i = 0; i < MR; ++i)
+        for (int j = 0; j < 4; ++j)
+            c[i][j] = vdupq_n_f64(0.0);
+
+    for (int p = 0; p < kc; ++p) {
+        const double *bp = B + p * ldb;
+        float64x2_t b0 = vld1q_f64(bp + 0);
+        float64x2_t b1 = vld1q_f64(bp + 2);
+        float64x2_t b2 = vld1q_f64(bp + 4);
+        float64x2_t b3 = vld1q_f64(bp + 6);
+
+        for (int i = 0; i < MR; ++i) {
+            float64x2_t a = vld1q_dup_f64(A + i * kc + p);
+            c[i][0] = vfmaq_f64(c[i][0], a, b0);
+            c[i][1] = vfmaq_f64(c[i][1], a, b1);
+            c[i][2] = vfmaq_f64(c[i][2], a, b2);
+            c[i][3] = vfmaq_f64(c[i][3], a, b3);
+        }
+    }
+
+    for (int i = 0; i < MR; ++i) {
+        double *cp = C + i * ldc;
+        for (int j = 0; j < 4; ++j)
+            vst1q_f64(cp + 2 * j, vaddq_f64(c[i][j], vld1q_f64(cp + 2 * j)));
+    }
+}
+#else
 /*
     6×8 AVX2 / FMA micro‑kernel
     A: MR × kc
@@ -133,6 +182,8 @@ static inline void micro_kernel_6x8(
     );
 }
 
+#endif
+
 /* pack A (mc × kc) into contiguous buffer */
 static inline void pack_A(int mc, int kc, const double *A, int lda, double *Apack)
 {
@@ -175,14 +226,20 @@ static void dgemm_slice(thread_arg_t *ts)
 
                 for (int jr = 0; jr < nc; jr += NR) {
                     for (int ir = 0; ir < mc; ir += MR) {
-                        micro_kernel_6x8(
-                            kc,
-                            ts->Apack + ir * kc,
-                            ts->Bpack + jr,
-                            nc,
-                            ts->C + (ic + ir) * N + jc + jr,
-                            N
-                        );
+                        double *Cp = ts->C + (ic + ir) * N + jc + jr;
+                        if (ir + MR <= mc) {
+                            micro_kernel_6x8(kc, ts->Apack + ir * kc,
+                                             ts->Bpack + jr, nc, Cp, N);
+                        } else {
+                            /* edge tile: the kernel always writes MR rows, so
+                               accumulate into scratch and copy the valid rows */
+                            double tmp[MR * NR] = {0};
+                            micro_kernel_6x8(kc, ts->Apack + ir * kc,
+                                             ts->Bpack + jr, nc, tmp, NR);
+                            for (int i = 0; i < mc - ir; ++i)
+                                for (int j = 0; j < NR; ++j)
+                                    Cp[i * N + j] += tmp[i * NR + j];
+                        }
                     }
                 }
             }
@@ -261,7 +318,22 @@ int main(void)
     }
 
     double t1 = wall_seconds();
-    printf("Time: %.3f s\n", t1 - t0);
+    printf("Time: %.3f s (%.1f GFLOP/s, %d threads)\n", t1 - t0,
+           2.0 * N * N * N / (t1 - t0) * 1e-9, NUM_THREADS);
+
+#ifdef VERIFY
+    double maxerr = 0.0;
+    for (int s = 0; s < 64; ++s) {
+        int i = (int)(((long)s * 2654435761L) % N);
+        int j = (int)(((long)s * 40503L + 17) % N);
+        double ref = 0.0;
+        for (int k = 0; k < N; ++k) ref += A[i * N + k] * B[k * N + j];
+        double err = fabs(ref - C[i * N + j]) / (fabs(ref) + 1.0);
+        if (err > maxerr) maxerr = err;
+    }
+    printf("Verify: max rel err %.3e (%s)\n", maxerr, maxerr < 1e-9 ? "OK" : "FAIL");
+    if (maxerr >= 1e-9) return 1;
+#endif
 
     return 0;
 }

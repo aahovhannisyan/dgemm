@@ -1,5 +1,18 @@
-CC = gcc
-CFLAGS = -O3 -march=native -ffast-math -mfma -funroll-loops -pthread
+CC ?= cc
+ARCH := $(shell uname -m)
+
+ifeq ($(ARCH),$(filter $(ARCH),arm64 aarch64))
+ARCH_FLAGS = -mcpu=native
+# Tuned on Apple M5 Pro (5+10 cores). 16 threads split the 16 NC-wide column blocks evenly.
+THREADS ?= 16
+KC ?= 384
+NC ?= 256
+else
+ARCH_FLAGS = -march=native -mfma
+THREADS ?= 12
+endif
+
+CFLAGS = -O3 $(ARCH_FLAGS) -ffast-math -funroll-loops -pthread
 
 # Macro defaults (override on the command line if you want)
 KC ?= 256
@@ -7,7 +20,10 @@ MC ?= 6
 NC ?= 64
 
 # Turn macros into -D flags
-DFLAGS := -DKC=$(KC) -DMC=$(MC) -DNC=$(NC)
+DFLAGS := -DKC=$(KC) -DMC=$(MC) -DNC=$(NC) -DNUM_THREADS=$(THREADS)
+ifdef VERIFY
+DFLAGS += -DVERIFY
+endif
 
 SRC := dgemm.c
 BIN_DIR := bin
@@ -21,11 +37,11 @@ all: $(BIN)
 $(BIN_DIR):
 	mkdir -p $@
 
-$(BIN_DIR)/%.o: %.c | $(BIN_DIR)
+$(BIN_DIR)/%.o: %.c Makefile | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(DFLAGS) -c $< -o $@
 
 $(BIN): $(OBJ) Makefile
-	$(CC) $(OBJ) -o $@
+	$(CC) -pthread $(OBJ) -o $@
 
 clean:
 	rm -rf $(BIN_DIR)
