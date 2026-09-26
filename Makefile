@@ -1,13 +1,18 @@
 CC ?= cc
 MPICC ?= mpicc
 ARCH := $(shell uname -m)
+OS := $(shell uname -s)
 
-ifeq ($(ARCH),$(filter $(ARCH),arm64 aarch64))
+ifeq ($(OS)-$(ARCH),Darwin-arm64)
 ARCH_FLAGS = -mcpu=native
 # Tuned on Apple M5 Pro (5+10 cores). 16 threads split the 16 NC-wide column blocks evenly.
 THREADS ?= 16
 KC ?= 384
 NC ?= 256
+else ifeq ($(ARCH),aarch64)
+ARCH_FLAGS = -mcpu=native
+# Graviton3E (hpc7g.16xlarge, 64 Neoverse-V1 cores). Block sizes not yet tuned.
+THREADS ?= 64
 else
 ARCH_FLAGS = -march=native -mfma
 THREADS ?= 12

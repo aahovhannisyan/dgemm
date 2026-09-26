@@ -41,6 +41,9 @@ for blocking broadcasts, `--verify` to check every entry of C, and `--csv` (with
 GFLOP/s) for a machine-readable line. `make test-summa` runs a correctness sweep over grid shapes,
 uneven block sizes and panel widths.
 
+To run on a Graviton (hpc7g) Slurm cluster on AWS, with ScaLAPACK, COSMA, SLATE and a Python
+stack installed for comparison, see [infra/README.md](infra/README.md).
+
 ## Compare with numpy
 ```
 python3 -m venv .venv && .venv/bin/pip install numpy

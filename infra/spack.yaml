@@ -1,0 +1,48 @@
+# Spack environment (Spack v1.2) with the libraries the distributed DGEMM is compared against.
+# Installed on an hpc7g compute node by infra/install-software.sbatch, which also registers the
+# EFA-enabled Open MPI that ships with the ParallelCluster AMI as an external.
+spack:
+  specs:
+    # BLAS for single-node baselines and as the local kernel of every distributed library
+    - openblas threads=openmp
+    - armpl-gcc
+    # ScaLAPACK PDGEMM, on both BLAS libraries
+    - netlib-scalapack ^openblas
+    - netlib-scalapack ^armpl-gcc
+    # COSMA with its miniapps (cosma_miniapp, pxgemm_miniapp) and ScaLAPACK wrapper API
+    - cosma +scalapack +apps ^openblas ^netlib-scalapack
+    # SLATE (CPU only)
+    - slate +openmp ^openblas
+    # Python stack for the mpi4py SUMMA and Dask baselines (Dask itself comes from pip)
+    - python@3.12
+    - py-pip
+    - py-numpy ^openblas
+    - py-mpi4py
+
+  concretizer:
+    # the two netlib-scalapack builds cannot live in one fully unified DAG
+    unify: when_possible
+
+  packages:
+    all:
+      require:
+        - target=neoverse_v1
+      providers:
+        mpi: [openmpi]
+        blas: [openblas]
+        lapack: [openblas]
+        scalapack: [netlib-scalapack]
+    openmpi:
+      # never build MPI: the AMI's Open MPI is the one wired up for EFA and Slurm
+      buildable: false
+
+  view:
+    # only the Python packages, so `python3` from here sees numpy and mpi4py
+    python:
+      root: /shared/spack-envs/dgemm-python-view
+      select: [python, py-pip, py-numpy, py-mpi4py]
+      link: roots
+
+  config:
+    build_stage:
+      - /tmp/$user/spack-stage

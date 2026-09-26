@@ -1,0 +1,65 @@
+# AWS ParallelCluster 3 cluster for the distributed DGEMM benchmarks (schema checked against 3.16).
+# infra/render-config.sh fills the placeholders in pcluster.yaml.template from infra/cluster.env
+# and writes infra/pcluster.yaml (not committed). Edit the template, not the rendered file.
+Region: ${AWS_REGION}
+Image:
+  Os: alinux2023
+Tags:
+  - Key: project
+    Value: dgemm-bench
+
+HeadNode:
+  # Graviton3 like the compute nodes, so binaries built on either run on both.
+  # Also hosts Open OnDemand later, hence 4 vCPU / 8 GiB rather than the smallest size.
+  InstanceType: c7g.xlarge
+  Networking:
+    SubnetId: ${HEAD_SUBNET_ID}
+  Ssh:
+    KeyName: ${SSH_KEY_NAME}
+    AllowedIps: ${ALLOWED_CIDR}
+  LocalStorage:
+    RootVolume:
+      Size: 50
+  Iam:
+    AdditionalIamPolicies:
+      # lets you reach the head node through SSM Session Manager as well as SSH
+      - Policy: arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+Scheduling:
+  Scheduler: slurm
+  SlurmSettings:
+    ScaledownIdletime: 10          # minutes before an idle compute node is terminated
+    QueueUpdateStrategy: TERMINATE
+  SlurmQueues:
+    - Name: hpc7g
+      CapacityType: ONDEMAND
+      JobExclusiveAllocation: true # never share a node between jobs: benchmarks need whole nodes
+      Networking:
+        # EFA does not work across availability zones: one private subnet, in an AZ that offers hpc7g
+        SubnetIds:
+          - ${COMPUTE_SUBNET_ID}
+        PlacementGroup:
+          Enabled: true
+      ComputeSettings:
+        LocalStorage:
+          RootVolume:
+            Size: 50
+      ComputeResources:
+        - Name: hpc7g-16xl
+          Instances:
+            - InstanceType: hpc7g.16xlarge   # 64 Graviton3E cores, 128 GiB, 200 Gbps EFA
+          MinCount: 0                        # scale to zero when idle
+          MaxCount: ${MAX_NODES}
+          Efa:
+            Enabled: true
+
+SharedStorage:
+  # Spack, the Python venv, this repo and results live here, NFS-shared to every node.
+  # Deleted with the cluster: copy results off first (see infra/README.md).
+  - MountDir: /shared
+    Name: shared
+    StorageType: Ebs
+    EbsSettings:
+      VolumeType: gp3
+      Size: 200
+      DeletionPolicy: Delete
