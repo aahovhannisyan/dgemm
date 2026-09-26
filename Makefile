@@ -1,4 +1,5 @@
 CC ?= cc
+MPICC ?= mpicc
 ARCH := $(shell uname -m)
 
 ifeq ($(ARCH),$(filter $(ARCH),arm64 aarch64))
@@ -28,10 +29,11 @@ endif
 BIN_DIR := bin
 BIN := $(BIN_DIR)/dgemm
 TEST_BIN := $(BIN_DIR)/test_gemm_local
+SUMMA_BIN := $(BIN_DIR)/summa
 LIB_OBJ := $(BIN_DIR)/gemm_local.o
 HDR := src/gemm_local.h
 
-.PHONY: all test clean
+.PHONY: all summa test test-summa clean
 
 all: $(BIN)
 
@@ -47,14 +49,25 @@ $(BIN_DIR)/dgemm.o: dgemm.c $(HDR) Makefile | $(BIN_DIR)
 $(BIN_DIR)/test_gemm_local.o: tests/test_gemm_local.c $(HDR) Makefile | $(BIN_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BIN_DIR)/summa.o: src/summa.c $(HDR) Makefile | $(BIN_DIR)
+	$(MPICC) $(CFLAGS) $(DFLAGS) -c $< -o $@
+
 $(BIN): $(BIN_DIR)/dgemm.o $(LIB_OBJ)
 	$(CC) -pthread $^ -o $@
 
 $(TEST_BIN): $(BIN_DIR)/test_gemm_local.o $(LIB_OBJ)
 	$(CC) -pthread $^ -o $@
 
+$(SUMMA_BIN): $(BIN_DIR)/summa.o $(LIB_OBJ)
+	$(MPICC) -pthread $^ -o $@
+
+summa: $(SUMMA_BIN)
+
 test: $(TEST_BIN)
 	./$(TEST_BIN)
+
+test-summa: $(SUMMA_BIN)
+	./tests/test_summa.sh
 
 clean:
 	rm -rf $(BIN_DIR)
